@@ -41,14 +41,53 @@ async function start() {
 
   io.use(async (socket, next) => {
     try {
-  // Log handshake origin for debugging in production
-  console.log('socket handshake origin=', socket.handshake && socket.handshake.headers && socket.handshake.headers.origin);
+      // Log handshake origin for debugging in production
+      console.log('socket handshake origin=', socket.handshake && socket.handshake.headers && socket.handshake.headers.origin);
       // Debug: log full cookie header and auth object
       console.log('socket auth object:', socket.handshake.auth);
+      console.log('socket query:', socket.handshake.query);
+      console.log('socket headers:', socket.handshake.headers);
       console.log('socket cookie header:', socket.handshake.headers.cookie);
       
-      // Prefer explicit auth token from the client, but fall back to parsing cookies
-      let token = socket.handshake.auth && socket.handshake.auth.token;
+      let token = null;
+      
+      // Method 1: Check auth object (multiple fields)
+      if (socket.handshake.auth) {
+        token = socket.handshake.auth.token || 
+                socket.handshake.auth.authorization || 
+                socket.handshake.auth.Authorization;
+        
+        // Handle Bearer format
+        if (token && token.startsWith('Bearer ')) {
+          token = token.substring(7);
+        }
+      }
+      
+      // Method 2: Check query parameters
+      if (!token && socket.handshake.query) {
+        token = socket.handshake.query.token || 
+                socket.handshake.query.auth || 
+                socket.handshake.query.authorization;
+        
+        // Handle Bearer format
+        if (token && token.startsWith('Bearer ')) {
+          token = token.substring(7);
+        }
+      }
+      
+      // Method 3: Check headers
+      if (!token && socket.handshake.headers) {
+        token = socket.handshake.headers.token || 
+                socket.handshake.headers.authorization ||
+                socket.handshake.headers.Authorization;
+        
+        // Handle Bearer format
+        if (token && token.startsWith('Bearer ')) {
+          token = token.substring(7);
+        }
+      }
+      
+      // Method 4: Parse cookies (existing logic)
       if (!token && socket.handshake && socket.handshake.headers && socket.handshake.headers.cookie) {
         // cookie string may look like: 'a=1; token=eyJ...; other=2'
         const m = /(?:^|; )token=([^;]+)/.exec(socket.handshake.headers.cookie);
@@ -59,19 +98,31 @@ async function start() {
           console.log('no token found in cookie header');
         }
       }
+      
+      console.log('🔍 Final extracted token:', token ? 'Present' : 'Missing');
+      
       if (!token) {
         console.log('no token available, continuing as guest');
         return next();
       }
+      
       const decoded = verifyToken(token);
       if (!decoded) {
         console.log('token verification failed');
         return next();
       }
+      
       const user = await User.findById(decoded.userId).lean();
       if (user) {
-        socket.user = { userId: user._id.toString(), username: user.username };
-        console.log('socket authenticated user:', user.username);
+        socket.user = { 
+          userId: user._id.toString(), 
+          username: user.username,
+          email: user.email,
+          decoded: decoded // Keep full JWT payload for debugging
+        };
+        console.log('✅ socket authenticated user:', user.username, 'userId:', user._id.toString());
+      } else {
+        console.log('❌ user not found in database for userId:', decoded.userId);
       }
       return next();
     } catch (err) {
@@ -100,13 +151,20 @@ async function start() {
 
     socket.on('sendMessage', async (payload, ack) => {
       console.log('📩 socket sendMessage received:', { payload, socketId: socket.id, userId: socket.user?.userId });
+      console.log('🔐 socket user object:', socket.user);
+      
       try {
-        const { city, groupName, text, media } = payload || {};
+        const { city, groupName, text, media, _auth, token, authorization, userId, username } = payload || {};
+        
+        // Debug: log all potential auth fields in payload
+        console.log('🔍 Auth fields in payload:', { _auth: !!_auth, token: !!token, authorization: !!authorization, userId, username });
+        
         if (!city || !groupName) {
           console.warn('❌ sendMessage missing fields:', { city, groupName });
           if (typeof ack === 'function') ack({ success: false, message: 'Missing fields' });
           return;
         }
+        
         const cityDoc = await City.findOne({ cityName: city });
         if (!cityDoc) {
           console.warn('❌ sendMessage city not found:', city);
@@ -114,17 +172,58 @@ async function start() {
           return;
         }
 
-        // require authenticated user when present on socket
-        const userId = socket.user ? socket.user.userId : null;
-        if (!userId) {
+        // Try to get authenticated user ID from multiple sources
+        let authenticatedUserId = null;
+        
+        // Method 1: From socket.user (preferred)
+        if (socket.user && socket.user.userId) {
+          authenticatedUserId = socket.user.userId;
+          console.log('✅ Using socket.user.userId:', authenticatedUserId);
+        }
+        // Method 2: Try to authenticate using token from payload
+        else if (_auth || token || authorization) {
+          const payloadToken = _auth || token || (authorization && authorization.startsWith('Bearer ') ? authorization.substring(7) : authorization);
+          console.log('🔄 Attempting auth with payload token...');
+          
+          if (payloadToken) {
+            const decoded = verifyToken(payloadToken);
+            if (decoded) {
+              const user = await User.findById(decoded.userId).lean();
+              if (user) {
+                authenticatedUserId = user._id.toString();
+                console.log('✅ Authenticated via payload token:', user.username);
+                // Update socket.user for future requests
+                socket.user = { 
+                  userId: user._id.toString(), 
+                  username: user.username,
+                  email: user.email 
+                };
+              }
+            }
+          }
+        }
+
+        if (!authenticatedUserId) {
           console.warn('❌ sendMessage user not authenticated');
+          console.warn('❌ Debug info:', { 
+            hasSocketUser: !!socket.user, 
+            socketUserId: socket.user?.userId,
+            hasPayloadAuth: !!(_auth || token || authorization),
+            payloadUserId: userId 
+          });
           if (typeof ack === 'function') ack({ success: false, message: 'Unauthenticated' });
           return;
         }
 
-        console.log('✅ sendMessage authenticated userId:', userId);
+        console.log('✅ sendMessage authenticated userId:', authenticatedUserId);
         console.log('💾 saving message to database...');
-        const msg = new ChatMessage({ city: cityDoc._id, groupName, sender: userId, text, media: media || [] });
+        const msg = new ChatMessage({ 
+          city: cityDoc._id, 
+          groupName, 
+          sender: authenticatedUserId, 
+          text, 
+          media: media || [] 
+        });
         await msg.save();
         console.log('✅ message saved, populating...');
         const populated = await ChatMessage.findById(msg._id).populate('sender', 'username profileImage');
